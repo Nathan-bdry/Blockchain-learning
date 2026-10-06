@@ -23,6 +23,8 @@ def deserialize_chain(raw_chain_data): #We rebuild an instance of the blockchain
 
 
 class Node:
+
+	# --------------------------------------- ALL METHODES --------------------------------------- 
 	
 	def __init__(self, host, port, peers):
 		self.host = host
@@ -67,6 +69,22 @@ class Node:
 		for peer in self.peers:
 			self.send(peer, message)
 
+	def create_and_broadcast_op(self, data):
+		op = JChain.Operation.create(data, self.privkey)
+		self.pending_ops.append(op)
+		self.broadcast({
+			"type": "NEW_OP",
+			"from": self.address,
+			"op": op.__dict__  
+		})
+		print(f"[+] Operation created and broadcasted: {data['op_type']}")
+		return op
+
+	# --------------------------------------------------------------------------------------------------
+
+
+	# --------------------------------------- ALL MESSAGES TYPES --------------------------------------- 
+	
 	def handle_message(self, msg):
 		t = msg["type"]
 
@@ -139,6 +157,19 @@ class Node:
 			else:
 				print(f"[!] Chain DIFFERS from peer {sender} (local: {local_hash}, remote: {remote_hash})")
 
+		if t == "NEW_OP":
+			op_data = msg["op"]
+			op_type = op_data["content"]["op_type"]
+			op_cls = getattr(JChain, op_type)
+			op = op_cls(op_data["content"], op_data["public_key"], op_data["signature"])
+			
+			if op not in self.pending_ops: #We add the operation to pending_ops if not already in
+				self.pending_ops.append(op)
+				print(f"[+] Received new pending operation: {op_type} from {msg['from']}")
+	
+	# ------------------------------------------------------------------------------------------ 
+
+
 
 if __name__ == "__main__":
 	port = int(sys.argv[1])
@@ -146,6 +177,8 @@ if __name__ == "__main__":
 
 	node = Node("localhost", port, peers)
 	node.start()
+
+	# --------------------------------------- ALL INPUTS --------------------------------------- 
 
 	while True:
 		cmd = input("> ")
@@ -212,3 +245,50 @@ if __name__ == "__main__":
 
 		elif cmd == "Blockchain": # if we type Blockchain" 
 			print(node.chain) # We print the Blockchain stored by the node
+
+		elif cmd == "pending": # if we type pending
+			print(f"Pending operations ({len(node.pending_ops)}):")
+			for op in node.pending_ops:
+				print(op) # We get all the pending operations
+
+		elif cmd.startswith("transfer "): # Here we need the syntax -> transfer <target> <amount>
+			_, target, amount = cmd.split()
+			data = {
+				"op_type": "Transfer",
+				"source": node.pubkey,
+				"target": target,
+				"amount": int(amount)
+			}
+			node.create_and_broadcast_op(data) # broadcast the transfer operation
+
+		elif cmd == "mykey": # Just print your pubkey for convinience
+			print(f"My public key: {node.pubkey}")
+
+		elif cmd.startswith("init "): # syntax -> init <account> <amount>
+			_, name, val = cmd.split()
+			data = {
+				"op_type": "Init",
+				"name": name,
+				"value": int(val)
+			}
+			node.create_and_broadcast_op(data) # broadcast the init operation
+
+		elif cmd.startswith("admin "): # syntax -> admin <key> (or 'admin me')
+			key = cmd.split()[1]
+			target_key = node.pubkey if key == "me" else key
+			data = {
+				"op_type": "EnrolAdminKey",
+				"key": target_key
+			}
+			node.create_and_broadcast_op(data) # broadcast the EnrolAdminKey operation
+
+		elif cmd == "snapshot": # save actual state
+			data = {
+				"op_type": "Snapshot",
+				"state": dict(node.state)
+			}
+			node.create_and_broadcast_op(data) # broadcast the snapshot operation
+
+
+
+	# ------------------------------------------------------------------------------------------------
