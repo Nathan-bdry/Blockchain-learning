@@ -40,8 +40,15 @@ class Operation():
 
     def content(self):
 
+        def serialize_val(obj):
+            if isinstance(obj, dict):
+                return {str(k): serialize_val(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [serialize_val(x) for x in obj]
+            return obj
+
         return {
-            key: value
+            str(key): serialize_val(value)
             for key, value in self.__dict__.items()
             if key not in ["signature", "public_key"]
         }
@@ -309,12 +316,16 @@ class Block():
 		
 	def json(self):
 		
-		def default_serializer(obj):
+		def serialize_val(obj):
 			if hasattr(obj, "__dict__"):
-				return obj.__dict__
-			raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+				return {str(k): serialize_val(v) for k, v in obj.__dict__.items()}
+			if isinstance(obj, dict):
+				return {str(k): serialize_val(v) for k, v in obj.items()}
+			if isinstance(obj, list):
+				return [serialize_val(x) for x in obj]
+			return obj
 
-		return json.dumps(self.__dict__, default=default_serializer, sort_keys=True, indent=2)
+		return json.dumps(serialize_val(self.__dict__), sort_keys=True, indent=2)
 		
 	def hash(self):
 		
