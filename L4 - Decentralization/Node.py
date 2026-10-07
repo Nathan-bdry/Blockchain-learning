@@ -1,25 +1,38 @@
 # usage: python Node.py <port> <peers>
 
-import socket, threading, sys, json
+import socket, threading, sys, json, copy
 import JCrypto
 import JChain
-from JChain import State, Blockchain, Block, Ledger
+from JChain import State, Blockchain, Block, Ledger #We rebuild an instance of the blockchain from the received JSON
 
-def deserialize_chain(raw_chain_data): #We rebuild an instance of the blockchain from the received JSON
-    blocks = []
-    for b_data in raw_chain_data:
-        operations = []
-        for op_data in b_data["operations"]:
-            op_type = op_data["content"]["op_type"]
-            op_cls = getattr(JChain, op_type)
-            op = op_cls(op_data["content"], op_data["public_key"], op_data["signature"])
-            operations.append(op)
-            
-        ledger = Ledger(operations)
-        block = Block(ledger, b_data["prev_hash"])
-        blocks.append(block)
-        
+def operation_eq(self, other): # Define equality on Operation so operations can be compared by value across serialization
+    return (
+        isinstance(other, JChain.Operation) and
+        self.content == other.content and
+        self.public_key == other.public_key and
+        self.signature == other.signature
+    )
+JChain.Operation.__eq__ = operation_eq
+
+# --------------------------------------- DESERIALIZATION ---------------------------------------
+# We need to deserialize ops, blocks and blockchain because we transfer JSON on the network and JSON only transfer dict, list, int, str.. no class or methodes
+
+def deserialize_operation(op_data): # rebuild an op instance from its JSON
+    op_type = op_data["content"]["op_type"]
+    op_cls = getattr(JChain, op_type)
+    return op_cls(op_data["content"], op_data["public_key"], op_data["signature"])
+
+
+def deserialize_block(b_data): # rebuild a block instance from its JSON
+    operations = [deserialize_operation(op) for op in b_data["operations"]]
+    return Block(Ledger(operations), b_data["prev_hash"])
+
+
+def deserialize_chain(raw_chain_data): # rebuild a blockchain instance from its JSON
+    blocks = [deserialize_block(b_data) for b_data in raw_chain_data]
     return Blockchain(blocks)
+
+# ------------------------------------------------------------------------------------------------
 
 
 class Node:
@@ -49,7 +62,12 @@ class Node:
 
 		while True:
 			conn, _ = s.accept()
-			data = conn.recv(8192)
+			data = b""
+			while True:
+				chunk = conn.recv(8192)
+				if not chunk:
+					break
+				data += chunk
 			if data:
 				self.handle_message(json.loads(data.decode()))
 			conn.close()
@@ -79,6 +97,50 @@ class Node:
 		})
 		print(f"[+] Operation created and broadcasted: {data['op_type']}")
 		return op
+	
+	def clean_pending_operations(self): # Verify the validity of ops in pending_ops
+		valid_ops = []
+		temp_state = copy.deepcopy(self.state)
+		for op in self.pending_ops: # for each op in pending_ops
+			if op.is_valid(temp_state): # We check if the op is valid 
+				temp_state = op.apply(temp_state) # if valid we add it to temp_state 
+				valid_ops.append(op) # and we add it to valid_ops
+			else:
+				print(f"[-] Invalid operation removed: {op.content['op_type']} (insufficient funds, bad signature or unauthorized)")
+
+		removed_count = len(self.pending_ops) - len(valid_ops)
+		self.pending_ops = valid_ops
+		print(f"[+] Pending operations cleaned: {len(self.pending_ops)} valid remaining ({removed_count} removed)")
+		return valid_ops
+
+
+	def mine_block(self): # Validate pending_ops, build a new block and broadcast it
+		
+		self.clean_pending_operations() # We first make sure that all ops are valid
+
+		if not self.pending_ops:
+			print("[-] No pending operations to include in block")
+			return None
+
+		ledger = Ledger(self.pending_ops) # Here we creat the ledger and the new block linked to the last hash
+		prev_hash = self.chain.hash()
+		new_block = Block(ledger, prev_hash)
+
+		self.chain.append(new_block) # Add the new block to our local chain 
+		self.state = new_block.operations.apply_ops(self.state) # update state
+		
+		self.pending_ops = [] # pending_ops empty because they are all in the new block
+
+		print(f"[+] Block created! Hash: {new_block.hash()} (Prev: {prev_hash})")
+
+		self.broadcast({  # broadcast block to all peers
+			"type": "NEW_BLOCK",
+			"from": self.address,
+			"block": new_block
+		})
+		return new_block
+
+
 
 	# --------------------------------------------------------------------------------------------------
 
@@ -133,6 +195,14 @@ class Node:
 			if len(received_chain) > len(self.chain): #If the received chain has more informations our chain is outdated
 				if received_chain.check_hashes() == True:  #if the received chain has correct hashes
 					self.chain = received_chain  # we update it
+
+					new_state = State({}) # We recompute state from updated chain
+					for b in self.chain:
+						new_state = b.operations.apply_ops(new_state)
+					self.state = new_state
+
+					mined_ops = [op for b in self.chain for op in b.operations] # We remove any operations that are now mined in the chain
+					self.pending_ops = [op for op in self.pending_ops if op not in mined_ops]
 					print(f"[+] Blockchain updated")
 				else:
 					print(f"[=] Blockchain kept (wrong hashes detected)")
@@ -163,10 +233,27 @@ class Node:
 			op_cls = getattr(JChain, op_type)
 			op = op_cls(op_data["content"], op_data["public_key"], op_data["signature"])
 			
-			if op not in self.pending_ops: #We add the operation to pending_ops if not already in
+			if op not in self.pending_ops: # We add the operation to pending_ops if not already in
 				self.pending_ops.append(op)
 				print(f"[+] Received new pending operation: {op_type} from {msg['from']}")
 	
+		if t == "NEW_BLOCK":
+			new_block = deserialize_block(msg["block"])
+			sender = tuple(msg["from"])
+
+			if new_block.prev_hash == self.chain.hash(): # If the new block feats with our last block
+				if new_block.operations.is_valid(copy.deepcopy(self.state)): # We verify the validity of the ops int this block
+					self.chain.append(new_block) # we add the new block
+					self.state = new_block.operations.apply_ops(self.state) # update state
+					self.pending_ops = [op for op in self.pending_ops if op not in new_block.operations] # We delete from our pending_ops ops in this block
+					print(f"[+] New block accepted from {sender}! Hash: {new_block.hash()}")
+				else:
+					print(f"[-] Block rejected from {sender}: invalid operations")
+			
+			else: # if the new block doesn't feets with our last block
+				print(f"[!] Block from {sender} does not link to our chain (fork or desync). Requesting full chain...")
+				self.send(sender, {"type": "GET_CHAIN", "from": self.address})
+
 	# ------------------------------------------------------------------------------------------ 
 
 
@@ -253,10 +340,11 @@ if __name__ == "__main__":
 
 		elif cmd.startswith("transfer "): # Here we need the syntax -> transfer <target> <amount>
 			_, target, amount = cmd.split()
+			target_acc = int(target) if target.isdigit() else target
 			data = {
 				"op_type": "Transfer",
 				"source": node.pubkey,
-				"target": target,
+				"target": target_acc,
 				"amount": int(amount)
 			}
 			node.create_and_broadcast_op(data) # broadcast the transfer operation
@@ -266,16 +354,17 @@ if __name__ == "__main__":
 
 		elif cmd.startswith("init "): # syntax -> init <account> <amount>
 			_, name, val = cmd.split()
+			target_name = node.pubkey if name == "me" else (int(name) if name.isdigit() else name)
 			data = {
 				"op_type": "Init",
-				"name": name,
+				"name": target_name,
 				"value": int(val)
 			}
 			node.create_and_broadcast_op(data) # broadcast the init operation
 
 		elif cmd.startswith("admin "): # syntax -> admin <key> (or 'admin me')
 			key = cmd.split()[1]
-			target_key = node.pubkey if key == "me" else key
+			target_key = node.pubkey if key == "me" else (int(key) if key.isdigit() else key)
 			data = {
 				"op_type": "EnrolAdminKey",
 				"key": target_key
@@ -289,6 +378,13 @@ if __name__ == "__main__":
 			}
 			node.create_and_broadcast_op(data) # broadcast the snapshot operation
 
+		elif cmd == "validate": # remove unvalid ops from pending_ops 
+			node.clean_pending_operations()
 
+		elif cmd == "mine": # mine a new block
+			node.mine_block()
+
+		elif cmd == "state": # display current state
+			print(f"Current State: {node.state}")
 
 	# ------------------------------------------------------------------------------------------------
