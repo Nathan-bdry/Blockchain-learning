@@ -172,9 +172,32 @@ class Block():
 	def is_authorized(self, state):
 		
 		return "admin_keys" in state and self.public_key in state["admin_keys"]
-	
-	def is_valid(self, state):
+
+	# Gets the amount of tokens staked by the validator of this block
+	def get_stake(self, state):
+
+		if not self.public_key:
+			return 0
+		if f"stake_{self.public_key}" in state:
+			return state[f"stake_{self.public_key}"]
+		if "stakes" in state and isinstance(state["stakes"], dict):
+			return state["stakes"].get(self.public_key, 0)
+		return 0
+
+	# Checks PoS condition: signature valid, stake > 0 and Hash(block) < target * stake
+	def is_pos_valid(self, state, target):
+
+		if not self.is_signature_valid():
+			return False
+		stake = self.get_stake(state)
+		if stake <= 0:
+			return False
+		return self.hash() < target * stake
+
+	def is_valid(self, state, target = None):
 		
+		if target is not None:
+			return self.is_pos_valid(state, target)
 		return self.is_signature_valid() and self.is_authorized(state)
 	
 
@@ -199,7 +222,7 @@ class Blockchain(list):
 		if self != []:
 			return self[-1].hash()
 
-	def is_valid(self, starting_state = State({})):
+	def is_valid(self, starting_state = State({}), target = None):
 		state = State(starting_state)
 		prev_hash = None
 		
@@ -208,7 +231,7 @@ class Blockchain(list):
 			if b.prev_hash != prev_hash:
 				return False
 
-			if not b.is_valid(state):
+			if not b.is_valid(state, target = target):
 				return False
 
 			if hasattr(b.content, "is_valid") and not b.content.is_valid(state):
@@ -255,6 +278,37 @@ class Transfer(Operation):
 		state[self.content["source"]] -= self.content["amount"]
 		state[self.content["target"]] += self.content["amount"]
 		
+		return state
+		
+
+# Staking tokens to become a validator node
+
+class Stake(Operation):
+
+	# Only the owner of the tokens can authorize staking them
+	def is_authorized(self, state):
+
+		account = self.content.get("account", self.public_key)
+		return self.public_key == account
+
+	# Account must exist and have enough tokens to stake
+	def is_op_logic_valid(self, state):
+
+		account = self.content.get("account", self.public_key)
+		amount = self.content.get("amount", 0)
+		return (account in state) and (amount > 0) and (state[account] >= amount)
+
+	# Moves staked tokens from account to a separate stake variable
+	def apply(self, state):
+
+		account = self.content.get("account", self.public_key)
+		amount = self.content.get("amount", 0)
+		stake_var = f"stake_{account}"
+		if stake_var not in state:
+			state[stake_var] = 0
+
+		state[account] -= amount
+		state[stake_var] += amount
 		return state
 		
 
