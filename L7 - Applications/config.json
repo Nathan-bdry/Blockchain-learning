@@ -1,0 +1,24 @@
+{
+  "priv_key": 65437821901,
+  "address": "10.224.1.172:8001",
+  "monitor": "10.224.0.143:5000",
+  "max_peers": 10,
+  "genesis": {
+    "content": {
+      "operations": [
+        {
+          "content": {
+            "amount": 1000000,
+            "name": 13828789712027994,
+            "op_type": "Init"
+          },
+          "public_key": 13828789712027994,
+          "signature": 132430957655536018
+        }
+      ],
+      "prev_hash": null
+    },
+  "public_key": 13828789712027994,
+  "signature": 25547002671408163
+  }
+}
